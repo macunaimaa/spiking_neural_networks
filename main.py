@@ -1,53 +1,73 @@
-import torch
-import numpy as np
-from numpy import arange
+from dataclasses import dataclass
+from re import T
+
+import jax
+import jax.numpy as jnp
 import pandas as pd
+import torch
+from jax import grad, jit, lax, vmap
+from numpy import arange
 
 
-class SpikingNN(torch.nn.Module):
-    def __init__(self):
-        self.T = 50
-        self.dt = 0.125
-        self.time = arange(0, self.T + self.dt, self.dt)
-        self.Pref = 0  # resting potential
-        self.Pmin = -1  # minimum potential
-        self.Pth = 25  # threshold
-        self.D = 0.25  # leakage factor
-        self.Pspike = 4  # spike potential
+@dataclass
+class SpikingNN:
+    T: float = 200.0
+    dt: float = 0.125
+    Pref: float = 0.0
+    Pmin: float = -1.0
+    Pth: float = 25.0
+    D: float = 0.25
+    Pspike: float = 4.0
+    t_ref: float = 5.0
 
-        self.count = 0  # refractory counter
-        self.t_ref = 5  # refractory period
-        self.t_rest = 0
+    def time(self):
+        return jnp.arange(0, self.T + self.dt, self.dt)
 
-    def loss(self):
-        return None
+    def init_state(self):
+        return (0.0, 0.0)
 
-    def update(self, Pn, S):
-        for i, t in enumerate(self.time):
-            if i == 0:
-                Pn[i] = S[i] - self.D
-            else:
-                if t <= self.t_rest:
-                    Pn[i] = self.Pref
-                elif t > self.t_rest:
-                    if Pn[i - 1] > self.Pmin:
-                        Pn[i] = Pn[i - 1] + S[i] - self.D
-                    else:
-                        Pn[i] = 0
-                if Pn[i] >= self.Pth:
-                    Pn[i] += self.Pspike
-                    self.t_rest = t + self.t_ref
-        return Pn
+    def update(self, state, S):
+        time = self.time()
+
+        def step(carry, inputs):
+            P_prev, t_rest = carry
+            S_i, t = inputs
+
+            def in_ref(_):
+                return self.Pref
+
+            def not_in_ref(_):
+                P = jnp.where(P_prev > self.Pmin, P_prev + S_i - self.D, 0)
+                return jnp.where(P >= self.Pth, P + self.Pspike, P)
+
+            P = lax.cond(t <= t_rest, in_ref, not_in_ref, operand=None)
+
+            spiked = P >= self.Pth
+
+            P = jnp.where(spiked, P + self.Pspike, P)
+            t_rest = jnp.where(spiked, t + self.t_ref, t_rest)
+
+            return (P, t_rest), P
+
+        carry0 = state
+
+        new_state, P_trace = lax.scan(step, carry0, (S, time))
+
+        return new_state, P_trace
 
 
 if __name__ == "__main__":
     network = SpikingNN()
+    state = network.init_state()
 
-    N = 500
+    N = 1601
 
-    input_vector = np.random.normal(0, 5, N)
-    other_input = np.random.normal(0, 4, N)
+    key = jax.random.PRNGKey(0)
+    key, subkey = jax.random.split(key)
+    input_vector = jax.random.normal(subkey, shape=(N,)) * 5
+
+    update = jit(network.update)
 
     for time in range(100):
-        P = network.update(input_vector, other_input)
+        P = update(state, input_vector)
         print("trace", P)

@@ -12,8 +12,8 @@ Currently this repo only possess a rather simplistic implementatation on predict
 - https://arxiv.org/abs/1804.08150
 
 ### important docs:
-https://docs.jax.dev/en/latest/jax-101.html
-https://arxiv.org/pdf/2503.02013 (could be useful idk)
+- https://docs.jax.dev/en/latest/jax-101.html
+- https://arxiv.org/pdf/2503.02013 (could be useful idk)
 
 ### Could be useful:
-weight initialization: https://arxiv.org/pdf/2410.00580
+- weight initialization: https://arxiv.org/pdf/2410.00580

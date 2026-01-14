@@ -1,26 +1,62 @@
 from dataclasses import dataclass
-from this import s
 
 import jax
 import jax.numpy as jnp
+import matplotlib.pyplot as plt
 import optax
 from jax import grad, jit, lax, vmap
-from jax._src.checkify import functionalization_error
-from jax._src.typing import StaticIndex
+from jax._src.interpreters.batching import batch
+from jax._src.numpy.lax_numpy import PadValue
+from sympy.external.ntheory import j
+from sympy.matrices.expressions.determinant import per
+
+# Training hyperparameters
+LEARNING_RATE = 0.001
+BATCH_SIZE = 128
+NUM_EPOCHS = 1000
+
+# Dataset parameters
+Data_DT = 0.1
+DT = 0.1
+SAMPLING_SIZE = 5
+SEQ_LENGTH = 200
+N_SAMPLES = 1000
+
+# Network architecture
+LAYER_SIZES = [SAMPLING_SIZE, 64, 64, 1]  # input -> hidden1 -> hidden2 -> output
 
 
-@dataclass(frozen=True)
+# Network initialization
+WEIGHT_SCALE = 0.8  # Scale for weight initialization
+BIAS_SCALE = 0.0  # Scale for bias initialization
+
+# Input encoding
+RATE_ENCODING_MAX = 1.0  # Maximum spike rate for input encoding
+
+# Surrogate gradient can also be set for 1-5 for more unstable NN
+SURROGATE_SIGMA = 5.0  # Sharpness of surrogate gradient
+
+# LIF neuron parameters
+LIF_THRESHOLD = 1.0  # Spike threshold (Pth)
+LIF_DECAY = 0.50  # Membrane potential decay (D)
+LIF_SPIKE_VALUE = 1.0  # Spike reset value (Pspike)
+LIF_REFRACTORY = 0.5  # Refractory period (t_ref)
+LIF_RESET = 0.2  # Reset potential (Pref)
+LIF_MIN = -0.5  # Minimum potential (Pmin)
+
+
+@dataclass(frozen=True)  # JAX: frozen=True makes dataclass hashable for jit
 class SpikingNN:
     """LIF neuron configuration (same as main.py)"""
 
     T: float = 200.0
-    dt: float = 0.125
-    Pref: float = 0.0
-    Pmin: float = -1.0
-    Pth: float = 10.0
-    D: float = 0.25
-    Pspike: float = 4.0
-    t_ref: float = 5.0
+    dt: float = DT
+    Pref: float = LIF_RESET
+    Pmin: float = LIF_MIN
+    Pth: float = LIF_THRESHOLD
+    D: float = LIF_DECAY
+    Pspike: float = LIF_SPIKE_VALUE
+    t_ref: float = LIF_REFRACTORY
 
     def time(self):
         return jnp.arange(0, self.T + self.dt, self.dt)
@@ -32,15 +68,6 @@ jax.tree_util.register_dataclass(
     data_fields=["T", "dt", "Pref", "Pmin", "Pth", "D", "Pspike", "t_ref"],
     meta_fields=[],
 )
-
-
-# Hyperparameters
-LEARNING_RATE = 0.002
-BATCH_SIZE = 32
-NUM_EPOCHS = 100
-LAYER_SIZES = [1, 128, 64, 1]  # input -> hidden1 -> hidden2 -> output
-SEQ_LENGTH = 100
-N_SAMPLES = 1000
 
 
 # JAX: custom_vjp allows defining custom gradients for non-differentiable operations
@@ -62,22 +89,24 @@ def spike_fwd(P, threshold):
 def spike_bwd(res, g):
     """Backward pass: use fast sigmoid as surrogate gradient"""
     P, threshold = res
-    sigma = 10.0  # Controls gradient sharpness
-    surrogate_grad = sigma / (1.0 + jnp.abs(sigma * (P - threshold))) ** 2
+    # Use hyperparameter for gradient sharpness
+    surrogate_grad = (
+        SURROGATE_SIGMA / (1.0 + jnp.abs(SURROGATE_SIGMA * (P - threshold))) ** 2
+    )
     return (g * surrogate_grad, None)  # None = no gradient for threshold
 
 
 spike_function.defvjp(spike_fwd, spike_bwd)
 
 
-def init_layer_params(key, in_dim, out_dim, scale=0.5):
+def init_layer_params(key, in_dim, out_dim):
     """Initialize weights and biases for one layer.
 
     JAX: Pytree parameters (nested dicts/arrays) work seamlessly with optimizers
     """
     key_w, key_b = jax.random.split(key)
-    W = jax.random.normal(key_w, (out_dim, in_dim)) * scale
-    b = jax.random.normal(key_b, (out_dim,)) * 0.1
+    W = jax.random.normal(key_w, (out_dim, in_dim)) * WEIGHT_SCALE
+    b = jax.random.normal(key_b, (out_dim,)) * BIAS_SCALE
     return {"W": W, "b": b}
 
 
@@ -160,8 +189,6 @@ def forward_pass(params, config, inputs):
         jnp.zeros(LAYER_SIZES[2]),
         jnp.zeros(LAYER_SIZES[2]),
     )
-    print("state_input shape:", state_input)
-    print("state_hidden shape:", state_hidden)
 
     # Layer 1: Input encoding to spikes
     _, spikes_input = spiking_layer(params["input"], state_input, inputs.T, config)
@@ -178,16 +205,11 @@ def forward_pass(params, config, inputs):
     return output.squeeze()
 
 
-# =============================================================================
-# Dataset Generation
-# =============================================================================
-
-
-def generate_sine_wave(key, n_samples, seq_length, dt):
-    """Generate sine wave time series for prediction task.
+def generate_sine_wave(key, n_samples, seq_length, dt, sampling_size):
+    """Generate sine wave time series for sliding window prediction.
 
     Returns:
-        inputs: [n_samples, seq_length, 1] - current values
+        inputs: [n_samples, seq_length, sampling_size] - sliding windows
         targets: [n_samples, seq_length, 1] - next values to predict
     """
     key_freq, key_phase = jax.random.split(key)
@@ -196,32 +218,28 @@ def generate_sine_wave(key, n_samples, seq_length, dt):
     freq = jax.random.uniform(key_freq, (n_samples,), minval=0.5, maxval=2.0)
     phase = jax.random.uniform(key_phase, (n_samples,), minval=0, maxval=2 * jnp.pi)
 
-    t = jnp.arange(seq_length + 1) * dt
+    t = jnp.arange(seq_length + sampling_size) * dt
 
-    # Generate sine waves: [n_samples, seq_length + 1]
+    # Generate sine waves: [n_samples, seq_length + sampling_size]
     signals = jnp.sin(2 * jnp.pi * freq[:, None] * t[None, :] + phase[:, None])
 
-    # Input: all but last timestep, Target: all but first timestep
-    inputs = signals[:, :-1, None]  # [n_samples, seq_length, 1]
-    targets = signals[:, 1:, None]  # [n_samples, seq_length, 1]
+    # Input: sliding windows, Target: next value after each window
+    window_idx = jnp.arange(seq_length)[:, None] + jnp.arange(sampling_size)[None, :]
+    inputs = jnp.take(signals, window_idx, axis=1)
+    targets = signals[:, sampling_size : sampling_size + seq_length, None]
 
     return jnp.array(inputs, dtype=jnp.float32), jnp.array(targets, dtype=jnp.float32)
 
 
-def rate_encode(signal, max_rate=10.0):
+def rate_encode(signal):
     """Convert continuous signal to spike rate encoding.
 
-    Normalizes sine wave from [-1, 1] to [0, max_rate]
+    Normalizes sine wave from [-1, 1] to [0, RATE_ENCODING_MAX]
     """
-    return (signal + 1.0) / 2.0 * max_rate
+    return (signal + 1.0) / 2.0 * RATE_ENCODING_MAX
 
 
 def mse_loss(params, config, inputs, targets):
-    """Mean squared error loss for regression.
-
-    JAX: Automatic differentiation will compute gradients through this function
-    """
-    # Encode inputs as spike rates
     encoded_inputs = rate_encode(inputs)
 
     # Forward pass
@@ -232,13 +250,33 @@ def mse_loss(params, config, inputs, targets):
     return loss
 
 
+def plot_predictions(predictions, targets, title="Predictions vs Targets"):
+    """Plot model predictions against targets for a single sequence."""
+    pred = jnp.array(predictions).squeeze()
+    tgt = jnp.array(targets).squeeze()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(pred, label="predictions")
+    plt.plot(tgt, label="targets", alpha=0.8)
+    plt.title(title)
+    plt.xlabel("Time step")
+    plt.ylabel("Value")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def batched_mse_loss(params, config, inputs, targets):
+    per_sample = jax.vmap(mse_loss, in_axes=(None, None, 0, 0))(
+        params, config, inputs, targets
+    )
+
+    return jnp.mean(per_sample)
+
+
 @jax.jit(static_argnames=("config"))
 def train_step(params, opt_state, config, inputs, targets):
-    """Single training step with gradient descent.
-
-    JAX: value_and_grad computes both loss and gradients in one pass
-    """
-    loss, grads = jax.value_and_grad(mse_loss)(params, config, inputs, targets)
+    loss, grads = jax.value_and_grad(batched_mse_loss)(params, config, inputs, targets)
 
     # Apply optimizer (Adam) updates
     updates, opt_state = optimizer.update(grads, opt_state, params)
@@ -263,14 +301,14 @@ if __name__ == "__main__":
     # 2. Sine wave dataset
     print("Generating dataset")
     train_inputs, train_targets = generate_sine_wave(
-        key_data, N_SAMPLES, SEQ_LENGTH, dt=0.1
+        key_data, N_SAMPLES, SEQ_LENGTH, dt=Data_DT, sampling_size=SAMPLING_SIZE
     )
     print(f"Dataset shape: inputs={train_inputs.shape}, targets={train_targets.shape}")
 
     # 3. Initialize network parameters
     print("\nInitializing network parameters")
     params = init_network_params(key_params, LAYER_SIZES)
-    config = SpikingNN(T=SEQ_LENGTH * 0.1, dt=0.1)
+    config = SpikingNN(T=SEQ_LENGTH * DT, dt=DT)
 
     # Print parameter shapes
     for layer_name, layer_params in params.items():
@@ -303,16 +341,9 @@ if __name__ == "__main__":
             batch_inputs = train_inputs_shuffled[batch_start:batch_end]
             batch_targets = train_targets_shuffled[batch_start:batch_end]
 
-            # JAX: vmap vectorizes train_step across the batch dimension
-            # This processes all samples in parallel
-            batched_train_step = vmap(
-                lambda inp, tgt: train_step(params, opt_state, config, inp, tgt),
-                in_axes=(0, 0),
-            )
-
             # For simplicity, training on just the first sample vmap implementation requires better state management
             params, opt_state, loss = train_step(
-                params, opt_state, config, batch_inputs[0], batch_targets[0]
+                params, opt_state, config, batch_inputs, batch_targets
             )
             epoch_loss += loss
 
@@ -336,3 +367,4 @@ if __name__ == "__main__":
     print(f"Test MSE: {test_mse:.6f}")
     print(f"Sample predictions (first 10): {test_pred[:10]}")
     print(f"Sample targets (first 10): {test_target.squeeze()[:10]}")
+    plot_predictions(test_pred, test_target, title="Test Predictions vs Targets")

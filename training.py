@@ -358,7 +358,7 @@ if __name__ == "__main__":
     # 6. Test on a sample
     print("\nTesting on sample")
     test_input = train_inputs[0]
-    test_target = train_targets[0]
+    test_target = train_targets[-1]
 
     encoded_test = rate_encode(test_input)
     test_pred = forward_pass(params, config, encoded_test)
